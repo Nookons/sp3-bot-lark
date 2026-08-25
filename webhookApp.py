@@ -3,8 +3,6 @@ import json
 import threading
 from collections import OrderedDict
 from rich.console import Console
-from rich.panel import Panel
-from rich.table import Table
 import os
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -25,9 +23,12 @@ from pending_photos import handle_incoming_photo, forward_error
 from error_parser import parse_error_message
 from lark_send import send_text_message
 from sendToDataBase import send_to_data_base
+from logging_config import setup_logging
 
 
 console = Console()
+logger = setup_logging(__name__)
+
 app = Flask(__name__)
 
 init_db()
@@ -40,10 +41,6 @@ WARSAW_TZ = ZoneInfo("Europe/Warsaw")
 
 
 def now_warsaw() -> datetime:
-    """
-    Returns current time in Europe/Warsaw timezone.
-    Works correctly with summer/winter time automatically.
-    """
     return datetime.now(WARSAW_TZ)
 
 
@@ -81,13 +78,6 @@ def _already_processed(message_id: str) -> bool:
 # ============================================================
 
 def _is_message_too_old(create_time) -> bool:
-    """
-    create_time от Lark приходит как Unix timestamp
-    в миллисекундах.
-
-    Сравнение выполняется в часовом поясе Europe/Warsaw.
-    """
-
     if not create_time:
         return False
 
@@ -100,10 +90,7 @@ def _is_message_too_old(create_time) -> bool:
         return False
 
     current_time = now_warsaw()
-
-    age_seconds = (
-        current_time - message_time
-    ).total_seconds()
+    age_seconds = (current_time - message_time).total_seconds()
 
     return age_seconds > MESSAGE_MAX_AGE_SECONDS
 
@@ -119,28 +106,13 @@ def webhook():
     if not data:
         return "", 200
 
-    # --------------------------------------------------------
-    # Lark URL verification
-    # --------------------------------------------------------
-
     if "challenge" in data:
-        return jsonify({
-            "challenge": data["challenge"]
-        })
-
-    # --------------------------------------------------------
-    # Event type
-    # --------------------------------------------------------
+        return jsonify({"challenge": data["challenge"]})
 
     if data.get("header", {}).get("event_type") != "im.message.receive_v1":
         return "", 200
 
-    # --------------------------------------------------------
-    # Event data
-    # --------------------------------------------------------
-
     event = data["event"]
-
     message = event["message"]
     sender = event["sender"]
 
@@ -152,11 +124,7 @@ def webhook():
     # --------------------------------------------------------
 
     if _already_processed(message_id):
-        console.print(
-            f"[yellow]Повторная доставка "
-            f"{message_id}, пропускаю[/yellow]"
-        )
-
+        logger.warning(f"Duplicate delivery {message_id}, skipping")
         return "", 200
 
     # --------------------------------------------------------
@@ -166,11 +134,10 @@ def webhook():
     create_time = message.get("create_time")
 
     if _is_message_too_old(create_time):
-        console.print(
-            f"[yellow]Сообщение {message_id} старше "
-            f"{MESSAGE_MAX_AGE_SECONDS}с, пропускаю[/yellow]"
+        logger.warning(
+            f"Message {message_id} is older than "
+            f"{MESSAGE_MAX_AGE_SECONDS}s, skipping"
         )
-
         return "", 200
 
     # --------------------------------------------------------
@@ -178,50 +145,20 @@ def webhook():
     # --------------------------------------------------------
 
     user_id = sender["sender_id"].get("user_id")
+    user_name = get_user_name(user_id, console)
 
-    user_name = get_user_name(
-        user_id,
-        console,
+    logger.info(
+        f"Incoming message | user={user_name} (id={user_id}) | "
+        f"chat_type={message['chat_type']} | "
+        f"type={message['message_type']} | "
+        f"message_id={message_id}"
     )
 
     # --------------------------------------------------------
     # Message content
     # --------------------------------------------------------
 
-    content = json.loads(
-        message["content"]
-    )
-
-    # --------------------------------------------------------
-    # Console table
-    # --------------------------------------------------------
-
-    table = Table(show_header=False)
-
-    table.add_row(
-        "👤 Пользователь",
-        user_name,
-    )
-
-    table.add_row(
-        "🆔 ID",
-        user_id,
-    )
-
-    table.add_row(
-        "💬 Чат",
-        message["chat_type"],
-    )
-
-    table.add_row(
-        "📝 Тип",
-        message["message_type"],
-    )
-
-    table.add_row(
-        "📨 Message ID",
-        message_id,
-    )
+    content = json.loads(message["content"])
 
     # ========================================================
     # TEXT MESSAGE
@@ -229,228 +166,120 @@ def webhook():
 
     if message["message_type"] == "text":
 
-        text = content.get(
-            "text",
-            "",
-        )
+        text = content.get("text", "")
 
-        table.add_row(
-            "💭 Текст",
-            text,
-        )
+        parsed = parse_error_message(text, chat_id)
 
-        # ----------------------------------------------------
-        # Parse error
-        # ----------------------------------------------------
+        if not parsed:
+            logger.warning(
+                f"Failed to parse message text {message_id}: "
+                f"'{text}' (chat_id={chat_id})"
+            )
 
-        parsed = parse_error_message(
-            text,
-            chat_id,
-        )
+            send_text_message(
+                chat_id,
+                "Can't parse the text from message, please try again",
+            )
+
+            return "", 200
 
         robot_data_response = get_data(
             f"{API_BASE_URL}/robots/get_robots_by_number",
             params={
-                "robot_number": int(
-                    parsed["robot"]
-                ),
+                "robot_number": int(parsed["robot"]),
                 "warehouse": "SMALL-P3",
                 "limit": 1,
             },
         )
-        robot_data = robot_data_response[0]
 
-        if parsed:
-
-            # ------------------------------------------------
-            # Current shift
-            # ------------------------------------------------
-
-            shift_date, shift_name = get_current_shift()
-
-            # ------------------------------------------------
-            # Save local error statistics
-            # ------------------------------------------------
-
-            save_error(
-                robot=parsed["robot"],
-                error_type=parsed["error_type"],
-                error_text=parsed["error_text"],
-                raw_text=text,
-                chat_id=chat_id,
-                shift_date=shift_date,
-                shift_name=shift_name,
+        if not robot_data_response:
+            logger.warning(
+                f"Robot #{parsed['robot']} not found in API, "
+                f"continuing with 'Unknown' warehouse "
+                f"(chat_id={chat_id})"
             )
-
-            table.add_row(
-                "🤖 Robot",
-                parsed["robot"],
-            )
-
-            table.add_row(
-                "⚠️ Issue Type",
-                parsed["error_type"],
-            )
-
-            # ------------------------------------------------
-            # Count robot errors
-            # ------------------------------------------------
-
-            count = count_robot_errors_in_shift(
-                parsed["robot"],
-                shift_date,
-                shift_name,
-            )
-
-            table.add_row(
-                "📊 Shift issues:",
-                str(count),
-            )
-
-            # ------------------------------------------------
-            # Warsaw time
-            # ------------------------------------------------
-
-            now = now_warsaw()
-
-            pretty = now.strftime(
-                "%d.%m.%Y %H:%M:%S"
-            )
-
-            # ------------------------------------------------
-            # Data for forwarding
-            # ------------------------------------------------
-            print(parsed)
-
-            table_lines = [
-                (
-                    "👤 Employee",
-                    user_name,
-                ),
-                (
-                    "🤖 Robot",
-                    parsed["robot"],
-                ),
-                (
-                    "⚠️ Time",
-                    pretty,
-                ),
-                (
-                    "📝 Details",
-                    parsed["error_text"],
-                ),
-                (
-                    "📝 Warehouse",
-                    robot_data["sub_warehouse"],
-                ),
-                (
-                    "📊 Shift issues",
-                    str(count),
-                ),
-            ]
-
-            data_obj = {
-                "employee": user_name,
-                "robot": parsed["robot"],
-                "error_text": parsed["error_text"],
-            }
-
-            # ------------------------------------------------
-            # Forward error
-            # ------------------------------------------------
-
-            forward_error(
-                parsed,
-                table_lines,
-            )
-
-            # ------------------------------------------------
-            # Save to API database
-            # ------------------------------------------------
-
-            send_to_data_base(
-                parsed,
-                data_obj,
-                chat_id,
-            )
-
-            # ------------------------------------------------
-            # Alert after threshold
-            # ------------------------------------------------
-
-            if count >= ERROR_THRESHOLD:
-
-                alert = (
-                    f"⚠️ Robot {parsed['robot']} "
-                    f"have {count} exceptions"
-                    f". Must be send to maintenance!"
-                )
-
-                send_text_message(
-                    chat_id,
-                    alert,
-                )
-
-                console.print(
-                    f"[bold red]{alert}[/bold red]"
-                )
-
+            warehouse = "Unknown"
         else:
+            robot_data = robot_data_response[0]
+            warehouse = robot_data.get("sub_warehouse") or "Unknown"
 
-            send_text_message(
-                chat_id,
-                "Can't parse the text from message, "
-                "please try again",
+        shift_date, shift_name = get_current_shift()
+
+        save_error(
+            robot=parsed["robot"],
+            error_type=parsed["error_type"],
+            error_text=parsed["error_text"],
+            raw_text=text,
+            chat_id=chat_id,
+            shift_date=shift_date,
+            shift_name=shift_name,
+        )
+
+        count = count_robot_errors_in_shift(
+            parsed["robot"], shift_date, shift_name
+        )
+
+        now = now_warsaw()
+        pretty = now.strftime("%d.%m.%Y %H:%M:%S")
+
+        logger.info(
+            f"New error | robot={parsed['robot']} | "
+            f"type={parsed['error_type']} | "
+            f"employee={user_name} | "
+            f"warehouse={warehouse} | "
+            f"shift_count={count}"
+        )
+
+        table_lines = [
+            ("👤 Employee", user_name),
+            ("🤖 Robot", parsed["robot"]),
+            ("⚠️ Time", pretty),
+            ("📝 Details", parsed["error_text"]),
+            ("🏭 Warehouse", warehouse),
+            ("📊 Shift issues", str(count)),
+        ]
+
+        data_obj = {
+            "employee": user_name,
+            "robot": parsed["robot"],
+            "error_text": parsed["error_text"],
+        }
+
+        forward_error(parsed, table_lines)
+        send_to_data_base(parsed, data_obj, chat_id)
+
+        if count >= ERROR_THRESHOLD:
+            alert = (
+                f"⚠️ Robot {parsed['robot']} "
+                f"have {count} exceptions"
+                f". Must be send to maintenance!"
             )
 
-            return "", 400
+            send_text_message(chat_id, alert)
+
+            logger.warning(
+                f"Robot {parsed['robot']} reached the error threshold "
+                f"for this shift: {count} >= {ERROR_THRESHOLD}"
+            )
 
     # ========================================================
     # IMAGE MESSAGE
     # ========================================================
 
     elif message["message_type"] == "image":
-
-        image_key = content.get(
-            "image_key"
-        )
-
-        table.add_row(
-            "🖼 Image key",
-            str(image_key),
-        )
+        image_key = content.get("image_key")
 
         if image_key:
-
-            filename = download_image(
-                image_key,
-                message_id,
-                console,
-            )
-
-            table.add_row(
-                "💾 Сохранено",
-                filename or "Ошибка",
-            )
+            filename = download_image(image_key, message_id, console)
 
             if filename:
-
-                handle_incoming_photo(
-                    filename,
-                    console,
+                logger.info(f"Image saved: {filename}")
+                handle_incoming_photo(filename, console)
+            else:
+                logger.error(
+                    f"Failed to download image "
+                    f"(image_key={image_key}, message_id={message_id})"
                 )
-
-    # ========================================================
-    # CONSOLE OUTPUT
-    # ========================================================
-
-    console.print(
-        Panel(
-            table,
-            title="[bold cyan]📩 Lark Message[/bold cyan]",
-            border_style="green",
-        )
-    )
 
     return "", 200
 
@@ -462,24 +291,13 @@ def webhook():
 @app.route("/shift_stats", methods=["GET"])
 def shift_stats_endpoint():
 
-    shift_date = request.args.get(
-        "date"
-    )
-
-    shift_name = request.args.get(
-        "shift"
-    )
+    shift_date = request.args.get("date")
+    shift_name = request.args.get("shift")
 
     if not shift_date or not shift_name:
+        shift_date, shift_name = get_current_shift()
 
-        shift_date, shift_name = (
-            get_current_shift()
-        )
-
-    total, by_robot, by_type = shift_stats(
-        shift_date,
-        shift_name,
-    )
+    total, by_robot, by_type = shift_stats(shift_date, shift_name)
 
     return jsonify({
         "shift_date": shift_date,
@@ -496,27 +314,12 @@ def shift_stats_endpoint():
 
 if __name__ == "__main__":
 
-    console.print(
-        "[bold green]Webhook запущен[/bold green]"
+    logger.info("Webhook server started")
+    logger.info(f"Timezone: {WARSAW_TZ}")
+    logger.info(
+        f"Current time: {now_warsaw().strftime('%d.%m.%Y %H:%M:%S')}"
     )
 
-    console.print(
-        f"[cyan]Timezone: {WARSAW_TZ}[/cyan]"
-    )
+    port = int(os.environ.get("PORT", 7777))
 
-    console.print(
-        f"[cyan]Current time: "
-        f"{now_warsaw().strftime('%d.%m.%Y %H:%M:%S')}[/cyan]"
-    )
-
-    port = int(
-        os.environ.get(
-            "PORT",
-            7777,
-        )
-    )
-
-    app.run(
-        host="0.0.0.0",
-        port=port,
-    )
+    app.run(host="0.0.0.0", port=port)
