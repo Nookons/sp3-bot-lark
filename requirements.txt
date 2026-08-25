@@ -1,0 +1,5 @@
+flask
+requests
+rapidfuzz
+rich
+python-dotenv
