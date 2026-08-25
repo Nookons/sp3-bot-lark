@@ -1,6 +1,6 @@
 from lark_media import upload_image, send_image_via_hook, send_text_via_hook
 
-TARGET_HOOK_URL = "https://open.larksuite.com/open-apis/bot/v2/hook/096a40d7-de43-4d96-bd4c-f7aa722e27b5"
+TARGET_HOOK_URL = "https://open.larksuite.com/open-apis/bot/v2/hook/4430e629-8cb8-41e6-8464-dfc7e333d044"
 
 def handle_incoming_photo(image_path: str, console=None):
     try:
