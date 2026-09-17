@@ -13,53 +13,176 @@ from logging_config import setup_logging
 
 logger = setup_logging(__name__)
 
+
 # ============================================================
 # CONFIG
 # ============================================================
+#
+# Бот больше не ходит через tk-assist-api: новый API убрал эндпоинты
+# записи исключений. Поэтому читаем и пишем напрямую в Supabase
+# (PostgREST) сервисным ключом.
 
-API_BASE_URL = os.environ.get(
-    "API_BASE_URL",
-    "https://tk-assistant-api-production.up.railway.app",
+SUPABASE_URL = os.environ.get(
+    "SUPABASE_URL",
+    "https://ljkugtpeboomboobodom.supabase.co",
 )
+
+SUPABASE_SERVICE_KEY = os.environ.get(
+    "SUPABASE_SERVICE_KEY",
+    "",
+)
+
+WAREHOUSE = "SMALL-P3"
+
+# Склад, который пишется в историческую таблицу (как в старом API).
+ISSUE_WAREHOUSE = "C2"
 
 WARSAW_TZ = ZoneInfo("Europe/Warsaw")
 
 
 # ============================================================
-# GET REQUEST
+# POSTGREST HELPERS
 # ============================================================
 
-def get_data(url: str, params: dict = None, headers: dict = None):
+def _headers() -> dict:
+    return {
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "Content-Type": "application/json",
+    }
+
+
+def _rest_get(table: str, params: dict = None):
+    """
+    GET /rest/v1/<table>. Возвращает JSON (список или объект)
+    либо None при ошибке.
+    """
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+
     try:
         response = requests.get(
-            url, params=params, headers=headers, timeout=5,
+            url,
+            headers=_headers(),
+            params=params,
+            timeout=10,
         )
+
         response.raise_for_status()
+
         return response.json()
 
     except requests.exceptions.RequestException as e:
-        logger.error(f"GET {url} failed: {e}")
+        logger.error(f"GET {table} failed: {e}")
         return None
 
 
-# ============================================================
-# POST REQUEST
-# ============================================================
+def _rest_post(table: str, payload: dict):
+    """
+    POST /rest/v1/<table>. Возвращает JSON (созданные строки)
+    либо None при ошибке.
+    """
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
 
-def post_data(url: str, payload: dict):
+    headers = _headers()
+    # PostgREST по умолчанию отдаёт пустое тело на POST — просим
+    # вернуть созданные строки, чтобы отличать успех от неудачи.
+    headers["Prefer"] = "return=representation"
+
     try:
         response = requests.post(
             url,
+            headers=headers,
             json=payload,
-            headers={"Content-Type": "application/json"},
-            timeout=5,
+            timeout=10,
         )
+
         response.raise_for_status()
+
+        logger.info(f"POST {table} -> {response.status_code}")
+
         return response.json()
 
     except requests.exceptions.RequestException as e:
-        logger.error(f"POST {url} failed: {e}")
+        logger.error(f"POST {table} failed: {e}")
         return None
+
+
+# ============================================================
+# SHIFT EXCEPTIONS (from Supabase)
+# ============================================================
+
+def get_shift_exceptions(
+    shift_date: str,
+    shift_name: str,
+    warehouse: str = WAREHOUSE,
+    limit: int = 1000,
+):
+    """
+    Список исключений за смену из таблицы exceptions_glpc.
+
+    Возвращает None, если запрос не удался.
+    """
+    return _rest_get(
+        "exceptions_glpc",
+        params={
+            "issue_data": f"eq.{shift_date}",
+            "shift_type": f"eq.{shift_name}",
+            "warehouse": f"eq.{warehouse}",
+            "order": "error_start_time.desc",
+            "limit": str(limit),
+        },
+    )
+
+
+def count_robot_errors_in_shift(
+    robot,
+    shift_date: str,
+    shift_name: str,
+):
+    """
+    Количество сохранённых исключений робота за смену.
+    Считаем по таблице exceptions_glpc (источник для отчётов).
+    """
+    data = get_shift_exceptions(shift_date, shift_name)
+
+    if not data:
+        return 0
+
+    robot_str = str(robot)
+
+    return sum(
+        1
+        for exc in data
+        if str(exc.get("error_robot")) == robot_str
+    )
+
+
+def shift_stats(shift_date: str, shift_name: str):
+    """
+    Возвращает (total, {robot: count}, {issue_type: count})
+    за смену из exceptions_glpc.
+    """
+    data = get_shift_exceptions(shift_date, shift_name)
+
+    if not data:
+        return 0, {}, {}
+
+    total = len(data)
+    by_robot = {}
+    by_type = {}
+
+    for exc in data:
+        robot = str(exc.get("error_robot"))
+        by_robot[robot] = by_robot.get(robot, 0) + 1
+
+        issue_type = (
+            exc.get("issue_type")
+            or exc.get("first_column")
+            or "unknown"
+        )
+        by_type[issue_type] = by_type.get(issue_type, 0) + 1
+
+    return total, by_robot, by_type
 
 
 # ============================================================
@@ -68,7 +191,7 @@ def post_data(url: str, payload: dict):
 
 def find_best_template(
     error_text: str,
-    templates: list[dict],
+    templates: list,
     threshold: int = 60,
 ):
     titles = [t.get("employee_title", "") for t in templates]
@@ -97,14 +220,39 @@ def find_best_template(
 # ============================================================
 
 def send_to_data_base(parsed: dict, table_lines: dict, chat_id: str):
+    """
+    Записывает исключение в Supabase (exceptions + exceptions_glpc).
 
-    error_templates = get_data(
-        f"{API_BASE_URL}/exceptionsTemplates/get_templates"
+    Возвращает результат POST /exceptions (список созданных строк)
+    при успехе, иначе None. Сообщения об ошибках отправляет в чат.
+    """
+
+    # ========================================================
+    # GET ERROR TEMPLATES
+    # ========================================================
+
+    error_templates = _rest_get(
+        "issue_templates",
+        params={
+            "select": "*",
+            "order": "created_at.desc",
+        },
     )
 
     if not error_templates:
         logger.error("Failed to fetch exception templates")
+
+        send_text_message(
+            chat_id,
+            "⚠️ Can't load issue templates right now. "
+            "Please try again in a minute.",
+        )
+
         return None
+
+    # ========================================================
+    # FIND BEST TEMPLATE
+    # ========================================================
 
     best_match = find_best_template(
         parsed["error_text"], error_templates,
@@ -114,33 +262,43 @@ def send_to_data_base(parsed: dict, table_lines: dict, chat_id: str):
         logger.warning(
             f"No matching template found for: '{parsed['error_text']}'"
         )
+
+        send_text_message(
+            chat_id,
+            "⚠️ Can't recognize the issue description. "
+            "Please check the text and try again.",
+        )
+
         return None
 
     logger.info(
-        f"Template found: {best_match['employee_title']} "
-        f"(id={best_match['id']})"
+        f"Template found: {best_match.get('employee_title')} "
+        f"(id={best_match.get('id')})"
     )
 
     # ========================================================
     # FIND EMPLOYEE
     # ========================================================
 
-    employee_data = get_data(
-        f"{API_BASE_URL}/employees/get_employee_by_name",
-        params={"name": table_lines["employee"]},
+    employee_data = _rest_get(
+        "employees",
+        params={
+            "select": "*",
+            "user_name": f"eq.{table_lines['employee']}",
+        },
     )
 
     if not employee_data:
 
-        alert = (
-            "⚠️ Can't find employee, issue don't save to database, "
-            "please check your name and try again."
-        )
-
-        send_text_message(chat_id, alert)
-
         logger.warning(
             f"Employee not found: '{table_lines['employee']}'"
+        )
+
+        send_text_message(
+            chat_id,
+            "⚠️ Employee not found. "
+            "The issue was not saved. "
+            "Please check your name and try again.",
         )
 
         return None
@@ -157,33 +315,43 @@ def send_to_data_base(parsed: dict, table_lines: dict, chat_id: str):
     end_time = now + timedelta(minutes=best_match["solving_time"])
     end_time_iso = end_time.isoformat()
 
-    pretty_date = now.strftime("%Y-%m-%d")
     pretty_datetime = now.strftime("%d.%m.%Y %H:%M:%S")
 
     # ========================================================
     # FIND ROBOT
     # ========================================================
 
-    robot_data = get_data(
-        f"{API_BASE_URL}/robots/get_robots_by_number",
+    robot_data = _rest_get(
+        "robots_maintenance_list",
         params={
-            "robot_number": int(table_lines["robot"]),
-            "warehouse": "SMALL-P3",
-            "limit": 1,
+            "select": "*",
+            "robot_number": f"eq.{int(table_lines['robot'])}",
+            "warehouse": f"eq.{WAREHOUSE}",
+            "order": "updated_at.desc",
+            "limit": "1",
         },
     )
 
     if not robot_data:
 
-        alert = (
-            f"⚠️ Can't find robot #{table_lines['robot']}, "
-            "issue don't save to database, please check the robot number."
+        _rest_post(
+            "robots_to_add",
+            {
+                "robot_number": table_lines["robot"],
+                "employee_id": employee["card_id"],
+                "warehouse": WAREHOUSE,
+            },
         )
-
-        send_text_message(chat_id, alert)
 
         logger.warning(
             f"Robot not found: #{table_lines['robot']}"
+        )
+
+        send_text_message(
+            chat_id,
+            f"⚠️ Robot #{table_lines['robot']} not found. "
+            "The issue was not saved. "
+            "Please check the robot number.",
         )
 
         return None
@@ -196,8 +364,14 @@ def send_to_data_base(parsed: dict, table_lines: dict, chat_id: str):
 
     shift_date, shift_name = get_current_shift(now)
 
+    logger.info(
+        f"Saving exception: robot={robot.get('robot_number')} "
+        f"employee={employee.get('user_name')} "
+        f"shift={shift_date}/{shift_name}"
+    )
+
     # ========================================================
-    # NEW EXCEPTION OBJECT
+    # NEW EXCEPTION OBJECT (таблица exceptions)
     # ========================================================
 
     obj = {
@@ -212,7 +386,7 @@ def send_to_data_base(parsed: dict, table_lines: dict, chat_id: str):
     }
 
     # ========================================================
-    # OLD EXCEPTION OBJECT
+    # OLD EXCEPTION OBJECT (таблица exceptions_glpc)
     # ========================================================
 
     old_obj = {
@@ -234,28 +408,46 @@ def send_to_data_base(parsed: dict, table_lines: dict, chat_id: str):
             f"{now_iso}"
         ),
         "shift_type": shift_name,
-        "warehouse": "SMALL-P3",
+        "warehouse": WAREHOUSE,
         "issue_data": shift_date,
-        "issue_warehouse": "C2",
+        "issue_warehouse": ISSUE_WAREHOUSE,
     }
 
     # ========================================================
-    # SAVE
+    # SAVE NEW EXCEPTION
     # ========================================================
 
-    saved = post_data(f"{API_BASE_URL}/exceptions/add_exceptions", obj)
-    saved_old = post_data(
-        f"{API_BASE_URL}/exceptions/add_old_exceptions", old_obj
-    )
+    saved = _rest_post("exceptions", obj)
+
+    # ========================================================
+    # SAVE OLD EXCEPTION
+    # ========================================================
+
+    saved_old = _rest_post("exceptions_glpc", old_obj)
+
+    # ========================================================
+    # CHECK RESULT
+    # ========================================================
 
     if not saved:
-        alert = "⚠️ Failed to save exception to database."
-        send_text_message(chat_id, alert)
+
         logger.error(
             f"Failed to save exception (robot={robot['robot_number']}, "
             f"employee={employee['user_name']})"
         )
+
+        send_text_message(
+            chat_id,
+            "⚠️ Failed to save the issue. "
+            "Please try again.",
+        )
+
         return None
+
+    if not saved_old:
+        logger.warning(
+            "New exception saved, but legacy (exceptions_glpc) failed"
+        )
 
     logger.info(
         f"✅ Exception saved successfully "

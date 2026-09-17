@@ -1,6 +1,6 @@
 import logging
-from logging.handlers import RotatingFileHandler
 import os
+from logging.handlers import RotatingFileHandler
 
 
 def setup_logging(name: str = "sp3_bot") -> logging.Logger:
@@ -19,6 +19,7 @@ def setup_logging(name: str = "sp3_bot") -> logging.Logger:
         return logger
 
     logger.setLevel(logging.INFO)
+    logger.propagate = False
 
     formatter = logging.Formatter(
         fmt="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
@@ -26,7 +27,7 @@ def setup_logging(name: str = "sp3_bot") -> logging.Logger:
     )
 
     # ------------------------------------------------------------
-    # Console handler
+    # Console handler (Railway собирает stdout/stderr)
     # ------------------------------------------------------------
 
     console_handler = logging.StreamHandler()
@@ -35,20 +36,27 @@ def setup_logging(name: str = "sp3_bot") -> logging.Logger:
     logger.addHandler(console_handler)
 
     # ------------------------------------------------------------
-    # File handler (с ротацией, чтобы лог-файлы не росли бесконечно)
+    # File handler (с ротацией, чтобы лог-файлы не росли бесконечно).
+    # Не критичен на Railway (ephemeral-диск), но удобен локально.
     # ------------------------------------------------------------
 
     log_dir = os.environ.get("LOG_DIR", "logs")
-    os.makedirs(log_dir, exist_ok=True)
 
-    file_handler = RotatingFileHandler(
-        filename=os.path.join(log_dir, "app.log"),
-        maxBytes=5 * 1024 * 1024,  # 5 MB
-        backupCount=5,
-        encoding="utf-8",
-    )
-    file_handler.setLevel(logging.INFO)
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+
+        file_handler = RotatingFileHandler(
+            filename=os.path.join(log_dir, "app.log"),
+            maxBytes=5 * 1024 * 1024,  # 5 MB
+            backupCount=5,
+            encoding="utf-8",
+        )
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    except OSError:
+        # Если файл логирования недоступен (например, read-only FS) —
+        # продолжаем работать с консольным обработчиком.
+        pass
 
     return logger

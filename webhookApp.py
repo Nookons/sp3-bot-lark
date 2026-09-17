@@ -7,22 +7,23 @@ import os
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from sendToDataBase import API_BASE_URL
-from sendToDataBase import get_data
-
 from getUserName import get_user_name
 from donwloadImage import download_image
-from database import (
-    init_db,
-    save_error,
+from pending_photos import handle_incoming_photo, forward_error
+from error_parser import parse_error_message
+from lark_send import send_text_message
+from sendToDataBase import (
+    SUPABASE_SERVICE_KEY,
+    send_to_data_base,
     count_robot_errors_in_shift,
     shift_stats,
 )
 from shift import get_current_shift
-from pending_photos import handle_incoming_photo, forward_error
-from error_parser import parse_error_message
-from lark_send import send_text_message
-from sendToDataBase import send_to_data_base
+from shift_report import (
+    build_shift_summary,
+    send_shift_report,
+    start_shift_scheduler,
+)
 from logging_config import setup_logging
 
 
@@ -30,8 +31,6 @@ console = Console()
 logger = setup_logging(__name__)
 
 app = Flask(__name__)
-
-init_db()
 
 # ============================================================
 # TIMEZONE
@@ -41,6 +40,10 @@ WARSAW_TZ = ZoneInfo("Europe/Warsaw")
 
 
 def now_warsaw() -> datetime:
+    """
+    Текущее время Europe/Warsaw (лето/зима учитывается
+    автоматически).
+    """
     return datetime.now(WARSAW_TZ)
 
 
@@ -50,6 +53,13 @@ def now_warsaw() -> datetime:
 
 ERROR_THRESHOLD = 3
 MESSAGE_MAX_AGE_SECONDS = 120
+
+PARSE_ERROR_HINT = (
+    "Can't parse the message. Please use the format:\n"
+    "<issue type>: <description>. <robot number>\n\n"
+    "Example:\n"
+    "Unable to drive: Security module failure. 3780"
+)
 
 _SEEN_LIMIT = 2000
 _seen_lock = threading.Lock()
@@ -78,6 +88,12 @@ def _already_processed(message_id: str) -> bool:
 # ============================================================
 
 def _is_message_too_old(create_time) -> bool:
+    """
+    create_time от Lark приходит как Unix timestamp
+    в миллисекундах.
+
+    Сравнение выполняется в часовом поясе Europe/Warsaw.
+    """
     if not create_time:
         return False
 
@@ -106,11 +122,23 @@ def webhook():
     if not data:
         return "", 200
 
+    # --------------------------------------------------------
+    # Lark URL verification
+    # --------------------------------------------------------
+
     if "challenge" in data:
         return jsonify({"challenge": data["challenge"]})
 
+    # --------------------------------------------------------
+    # Event type
+    # --------------------------------------------------------
+
     if data.get("header", {}).get("event_type") != "im.message.receive_v1":
         return "", 200
+
+    # --------------------------------------------------------
+    # Event data
+    # --------------------------------------------------------
 
     event = data["event"]
     message = event["message"]
@@ -168,7 +196,7 @@ def webhook():
 
         text = content.get("text", "")
 
-        parsed = parse_error_message(text, chat_id)
+        parsed = parse_error_message(text)
 
         if not parsed:
             logger.warning(
@@ -176,44 +204,39 @@ def webhook():
                 f"'{text}' (chat_id={chat_id})"
             )
 
-            send_text_message(
-                chat_id,
-                "Can't parse the text from message, please try again",
-            )
+            send_text_message(chat_id, PARSE_ERROR_HINT)
 
             return "", 200
 
-        robot_data_response = get_data(
-            f"{API_BASE_URL}/robots/get_robots_by_number",
-            params={
-                "robot_number": int(parsed["robot"]),
-                "warehouse": "SMALL-P3",
-                "limit": 1,
-            },
-        )
-
-        if not robot_data_response:
-            logger.warning(
-                f"Robot #{parsed['robot']} not found in API, "
-                f"continuing with 'Unknown' warehouse "
-                f"(chat_id={chat_id})"
-            )
-            warehouse = "Unknown"
-        else:
-            robot_data = robot_data_response[0]
-            warehouse = robot_data.get("sub_warehouse") or "Unknown"
+        # ----------------------------------------------------
+        # Current shift
+        # ----------------------------------------------------
 
         shift_date, shift_name = get_current_shift()
 
-        save_error(
-            robot=parsed["robot"],
-            error_type=parsed["error_type"],
-            error_text=parsed["error_text"],
-            raw_text=text,
-            chat_id=chat_id,
-            shift_date=shift_date,
-            shift_name=shift_name,
-        )
+        # ----------------------------------------------------
+        # Save to Supabase (exceptions + exceptions_glpc)
+        # ----------------------------------------------------
+
+        data_obj = {
+            "employee": user_name,
+            "robot": parsed["robot"],
+            "error_text": parsed["error_text"],
+        }
+
+        saved = send_to_data_base(parsed, data_obj, chat_id)
+
+        if not saved:
+            # Причина уже сообщена в чат внутри send_to_data_base.
+            logger.warning(
+                f"Exception not saved, skip forwarding: "
+                f"robot={parsed['robot']}"
+            )
+            return "", 200
+
+        # ----------------------------------------------------
+        # Count robot errors for this shift (from Supabase)
+        # ----------------------------------------------------
 
         count = count_robot_errors_in_shift(
             parsed["robot"], shift_date, shift_name
@@ -226,33 +249,34 @@ def webhook():
             f"New error | robot={parsed['robot']} | "
             f"type={parsed['error_type']} | "
             f"employee={user_name} | "
-            f"warehouse={warehouse} | "
+            f"shift={shift_date}/{shift_name} | "
             f"shift_count={count}"
         )
+
+        # ----------------------------------------------------
+        # Forward ready message to another chat
+        # ----------------------------------------------------
 
         table_lines = [
             ("👤 Employee", user_name),
             ("🤖 Robot", parsed["robot"]),
             ("⚠️ Time", pretty),
             ("📝 Details", parsed["error_text"]),
-            ("🏭 Warehouse", warehouse),
             ("📊 Shift issues", str(count)),
         ]
 
-        data_obj = {
-            "employee": user_name,
-            "robot": parsed["robot"],
-            "error_text": parsed["error_text"],
-        }
-
         forward_error(parsed, table_lines)
-        send_to_data_base(parsed, data_obj, chat_id)
+
+        # ----------------------------------------------------
+        # Alert after threshold
+        # ----------------------------------------------------
 
         if count >= ERROR_THRESHOLD:
+
             alert = (
                 f"⚠️ Robot {parsed['robot']} "
-                f"have {count} exceptions"
-                f". Must be send to maintenance!"
+                f"has {count} exceptions this shift. "
+                f"It should be sent to maintenance!"
             )
 
             send_text_message(chat_id, alert)
@@ -267,9 +291,11 @@ def webhook():
     # ========================================================
 
     elif message["message_type"] == "image":
+
         image_key = content.get("image_key")
 
         if image_key:
+
             filename = download_image(image_key, message_id, console)
 
             if filename:
@@ -309,6 +335,56 @@ def shift_stats_endpoint():
 
 
 # ============================================================
+# SHIFT REPORT (то же сообщение, что уходит в конце смены)
+# ============================================================
+
+@app.route("/shift_report", methods=["GET"])
+def shift_report_endpoint():
+    """
+    Предпросмотр отчёта за смену и (опционально) отправка его
+    в целевую группу.
+
+    /shift_report?date=2026-09-16&shift=night
+    /shift_report?date=2026-09-16&shift=night&send=1
+    """
+    shift_date = request.args.get("date")
+    shift_name = request.args.get("shift")
+
+    if not shift_date or not shift_name:
+        shift_date, shift_name = get_current_shift()
+
+    text = build_shift_summary(shift_date, shift_name)
+
+    do_send = str(request.args.get("send", "")).lower() in (
+        "1", "true", "yes", "send",
+    )
+
+    if do_send:
+        send_shift_report(shift_date, shift_name)
+
+    return jsonify({
+        "shift_date": shift_date,
+        "shift_name": shift_name,
+        "sent": do_send,
+        "text": text,
+    })
+
+
+# ============================================================
+# HEALTH
+# ============================================================
+
+@app.route("/health", methods=["GET"])
+def health_endpoint():
+    return jsonify({
+        "status": "ok",
+        "time": now_warsaw().strftime("%d.%m.%Y %H:%M:%S"),
+        "timezone": str(WARSAW_TZ),
+        "supabase_configured": bool(SUPABASE_SERVICE_KEY),
+    })
+
+
+# ============================================================
 # APPLICATION START
 # ============================================================
 
@@ -319,6 +395,13 @@ if __name__ == "__main__":
     logger.info(
         f"Current time: {now_warsaw().strftime('%d.%m.%Y %H:%M:%S')}"
     )
+    logger.info(
+        f"Supabase service key configured: "
+        f"{bool(SUPABASE_SERVICE_KEY)}"
+    )
+
+    # Отчёт за смену: в конце каждой смены шлёт метрики в группу.
+    start_shift_scheduler()
 
     port = int(os.environ.get("PORT", 7777))
 
